@@ -257,7 +257,8 @@ def notify(source, ref, name, email, amount, currency, results):
 # ---------------- core fulfilment ----------------
 def fulfil(source, ref, name, email, amount, currency, products, resolver):
     with LOCK:
-        seen = set(PAYMENTS.col_values(1))
+        rows = PAYMENTS.get_all_values()[1:]
+        seen = {r[0] for r in rows if len(r) > 10 and r[10] in ("GRANTED", "MANUAL")}
         new = [(f"{source}:{ref}:{norm(p)}", p) for p in products
                if f"{source}:{ref}:{norm(p)}" not in seen]
         if not new:
@@ -426,3 +427,8 @@ def probe_ghl(key: str):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/health/sheet")
+def sheet_health():
+    ws = get_sheet()
+    return {"ok": True, "title": ws.title}
