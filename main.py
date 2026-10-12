@@ -2,6 +2,7 @@
 import csv, hashlib, hmac, json, os, re, secrets, smtplib, threading, time
 from datetime import datetime, timezone
 from email.message import EmailMessage
+import base64
 
 import gspread
 import httpx
@@ -15,9 +16,23 @@ def env(k, d=""):
     return os.environ.get(k, d)
 
 
+def load_sa():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is empty in Render env vars")
+    if raw[0] in "'\"":
+        raw = raw.strip("'\"")
+    if not raw.startswith("{"):
+        try:
+            raw = base64.b64decode(raw).decode()  # also accepts a base64 copy of the file
+        except Exception:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be the full JSON key file contents")
+    return json.loads(raw)
+
+
 # ---------------- config (Render environment variables) ----------------
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-SA_JSON = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+SA_JSON = load_sa()
 ADMIN_KEY = os.environ["ADMIN_KEY"]                      # long random string, also used as ?key= in GHL webhook
 PAYSTACK_SECRET = env("PAYSTACK_SECRET_KEY")
 STRIPE_WHSEC = env("STRIPE_WEBHOOK_SECRET")

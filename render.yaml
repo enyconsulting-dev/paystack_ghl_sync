@@ -1,6 +1,47 @@
 services:
   - type: web
     name: paystack-ghl-sync
-    env: python
+    runtime: python
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: GHL_API_TOKEN
+        sync: false
+      - key: GHL_LOCATION_ID
+        sync: false
+      - key: KAJABI_CLIENT_ID
+        sync: false
+      - key: KAJABI_CLIENT_SECRET
+        sync: false
+      - key: KAJABI_SITE_ID
+        value: "83263"
+      - key: KAJABI_TAG_IDS
+        sync: false
+      - key: KAJABI_VAULT_TAG_ID
+        sync: false
+      - key: VAULT_OFFER_ID
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: TEAM_EMAILS
+        sync: false
+      - key: COACH_EMAILS
+        sync: false
+      - key: LIBRARY_URL
+        sync: false
