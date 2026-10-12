@@ -20,14 +20,38 @@ def load_sa():
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is empty in Render env vars")
-    if raw[0] in "'\"":
-        raw = raw.strip("'\"")
+
+    if raw[0] in "'\"" and raw[-1] == raw[0]:
+        raw = raw[1:-1].strip()
+
     if not raw.startswith("{"):
         try:
-            raw = base64.b64decode(raw).decode()  # also accepts a base64 copy of the file
-        except Exception:
-            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be the full JSON key file contents")
-    return json.loads(raw)
+            raw = base64.b64decode(raw, validate=True).decode("utf-8").strip()
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON must contain the full service-account "
+                "JSON key file contents, optionally base64-encoded"
+            ) from exc
+
+    try:
+        credentials = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON; paste the complete "
+            "service-account key file contents into Render without extra text"
+        ) from exc
+
+    if (
+        not isinstance(credentials, dict)
+        or credentials.get("type") != "service_account"
+        or not credentials.get("client_email")
+        or not credentials.get("private_key")
+    ):
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON must be a Google service-account key "
+            "containing type, client_email, and private_key"
+        )
+    return credentials
 
 
 # ---------------- config (Render environment variables) ----------------
