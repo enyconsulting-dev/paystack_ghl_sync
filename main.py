@@ -144,20 +144,33 @@ def log_raw(source, payload):
 KAJ = "https://api.kajabi.com/v1"
 
 
-def kajabi_token():
-    r = httpx.post(f"{KAJ}/oauth/token", timeout=20, data={
+def kajabi_token_response():
+    return httpx.post(f"{KAJ}/oauth/token", timeout=20, data={
         "grant_type": "client_credentials",
         "client_id": KAJABI_CLIENT_ID,
         "client_secret": KAJABI_CLIENT_SECRET})
+
+
+def kajabi_token():
+    r = kajabi_token_response()
     if r.status_code >= 300:
         raise RuntimeError(f"kajabi token {r.status_code}: {r.text[:200]}")
-    return r.json()["access_token"]
+    try:
+        return r.json()["access_token"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("kajabi token response did not include an access token") from exc
 
 
 def kh(token):
     return {"Authorization": f"Bearer {token}",
             "Content-Type": "application/vnd.api+json",
             "Accept": "application/vnd.api+json"}
+
+
+def kajabi_safe_headers(response):
+    names = {"content-type", "date", "request-id", "traceparent",
+             "x-kajabi-request-id", "x-request-id"}
+    return {key: value for key, value in response.headers.items() if key.lower() in names}
 
 
 def kajabi_contact(email, name):
@@ -498,12 +511,43 @@ def admin_fulfil(key: str, email: str, product: str, name: str = "", ref: str = 
 @app.get("/test/kajabi")
 def test_kajabi(key: str):
     check(key)
+    token_response = kajabi_token_response()
+    result = {
+        "token_status": token_response.status_code,
+        "token_headers": kajabi_safe_headers(token_response),
+        "site_id": KAJABI_SITE_ID,
+    }
+    if token_response.status_code >= 300:
+        result["token"] = "failed"
+        result["token_error"] = token_response.text[:1000]
+        return result
+
     try:
-        t = kajabi_token()
-        r = httpx.get(f"{KAJ}/me", headers=kh(t), timeout=20)
-        return {"token": "ok", "me_status": r.status_code, "me": r.text[:300]}
-    except Exception as e:
-        return {"error": str(e)}
+        token_data = token_response.json()
+    except ValueError:
+        result["token"] = "failed"
+        result["token_error"] = "Kajabi token response was not valid JSON"
+        return result
+    if not isinstance(token_data, dict):
+        result["token"] = "failed"
+        result["token_error"] = "Kajabi token response was not a JSON object"
+        return result
+    access_token = token_data.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        result["token"] = "failed"
+        result["token_error"] = "Kajabi token response did not include an access token"
+        return result
+
+    result["token"] = "ok"
+    result["token_metadata"] = {
+        name: token_data[name] for name in ("token_type", "expires_in", "scope")
+        if name in token_data
+    }
+    me_response = httpx.get(f"{KAJ}/me", headers=kh(access_token), timeout=20)
+    result["me_status"] = me_response.status_code
+    result["me"] = me_response.text[:1000]
+    result["me_headers"] = kajabi_safe_headers(me_response)
+    return result
 
 
 @app.get("/test/email")
