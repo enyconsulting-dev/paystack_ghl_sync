@@ -532,6 +532,13 @@ def test_kajabi(key: str):
         result["token"] = "failed"
         result["token_error"] = "Kajabi token response was not a JSON object"
         return result
+    result["token_fields"] = sorted(token_data.keys())
+    result["has_access_token"] = bool(token_data.get("access_token"))
+    result["has_refresh_token"] = bool(token_data.get("refresh_token"))
+    result["token_metadata"] = {
+        name: token_data[name] for name in ("token_type", "expires_in", "scope")
+        if name in token_data
+    }
     access_token = token_data.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         result["token"] = "failed"
@@ -539,10 +546,6 @@ def test_kajabi(key: str):
         return result
 
     result["token"] = "ok"
-    result["token_metadata"] = {
-        name: token_data[name] for name in ("token_type", "expires_in", "scope")
-        if name in token_data
-    }
     me_response = httpx.get(f"{KAJ}/me", headers=kh(access_token), timeout=20)
     result["me_status"] = me_response.status_code
     result["me"] = me_response.text[:1000]
