@@ -92,10 +92,20 @@ def slug(u):
     return (u or "").split("?")[0].rstrip("/").split("/")[-1].lower()
 
 
+def access_map_row(value):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    return BY_NAME.get(norm(value)) or BY_SLUG.get(slug(value))
+
+
 with open("access_map.csv", newline="", encoding="utf-8-sig") as f:
     ROWS = [r for r in csv.DictReader(f) if r.get(NAME_COL)]
 BY_NAME = {norm(r[NAME_COL]): r for r in ROWS}
 BY_SLUG = {slug(r[LINK_COL]): r for r in ROWS if r.get(LINK_COL)}
+VAULT_OFFER_ID = VAULT_OFFER_ID or next(
+    (r.get(OFFER_COL, "").strip() for r in ROWS if norm(r.get("Item", "")) == "vault"),
+    "")
 
 
 # ---------------- google sheets ----------------
@@ -263,6 +273,7 @@ def fulfil(source, ref, name, email, amount, currency, products, resolver):
                if f"{source}:{ref}:{norm(p)}" not in seen]
         if not new:
             return {"duplicate": True}
+        email = (email or "").strip()
         name = name or (email.split("@")[0] if email else "")
         ctx, results = None, []
         for key, p in new:
@@ -276,6 +287,8 @@ def fulfil(source, ref, name, email, amount, currency, products, resolver):
                 status = "MANUAL"
             else:
                 try:
+                    if not email:
+                        raise RuntimeError("buyer email is missing from the successful payment")
                     if ctx is None:
                         ctx = kajabi_contact(email, name)
                     note = kajabi_grant(ctx, offer)
@@ -287,6 +300,13 @@ def fulfil(source, ref, name, email, amount, currency, products, resolver):
             results.append({"product": product, "offer": offer, "status": status, "note": note})
         notify(source, ref, name, email, amount, currency, results)
         return {"items": results}
+
+
+def retry_if_grant_failed(result):
+    if any(item["status"] == "GRANT_FAILED" for item in result.get("items", [])):
+        raise HTTPException(
+            status_code=503,
+            detail="Kajabi course access could not be granted; retry this payment event.")
 
 
 def check(key):
@@ -310,20 +330,40 @@ async def ghl(request: Request):
     prods = [(i.get("name") if isinstance(i, dict) else str(i)).strip() for i in pn]
     if not email or not prods or not ref:
         return {"ok": False, "reason": "missing email, product or order_id. Read the Raw tab."}
-    return {"ok": True, **fulfil("ghl", ref, name, email, c.get("amount", ""),
-                                 c.get("currency", "USD"), prods,
-                                 lambda p: BY_NAME.get(norm(p)))}
+    result = fulfil("ghl", ref, name, email, c.get("amount", ""),
+                    c.get("currency", "USD"), prods, access_map_row)
+    retry_if_grant_failed(result)
+    return {"ok": True, **result}
 
 
 # ---------------- Paystack (NGN) ----------------
+def paystack_product(data):
+    metadata = data.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    candidates = [metadata.get("referrer")]
+    for key in ("product_name", "course_name", "product", "course", "payment_page", "payment_link"):
+        candidates.append(metadata.get(key))
+    custom_fields = metadata.get("custom_fields")
+    for field in custom_fields if isinstance(custom_fields, list) else []:
+        if not isinstance(field, dict):
+            continue
+        label = norm(field.get("display_name") or field.get("name") or field.get("variable_name"))
+        if "product" in label or "course" in label:
+            candidates.append(field.get("value"))
+
+    for candidate in candidates:
+        row = access_map_row(candidate)
+        if row:
+            return row[NAME_COL]
+    return next((str(candidate).strip() for candidate in candidates if candidate), "unknown-page")
+
+
 def paystack_item(x):
     cust = x.get("customer") or {}
-    meta = x.get("metadata") or {}
     name = " ".join(filter(None, [cust.get("first_name"), cust.get("last_name")]))
-    s = slug(meta.get("referrer") or "")
+    product = paystack_product(x)
     return fulfil("paystack", x["reference"], name, cust.get("email", ""),
-                  x["amount"] / 100, x.get("currency", "NGN"), [s or "unknown-page"],
-                  lambda _p: BY_SLUG.get(s))
+                  x["amount"] / 100, x.get("currency", "NGN"), [product], access_map_row)
 
 
 @app.post("/webhook/paystack")
@@ -336,7 +376,9 @@ async def paystack(request: Request):
     log_raw("paystack", d)
     if d.get("event") != "charge.success":
         return {"ok": True, "ignored": d.get("event")}
-    return {"ok": True, **paystack_item(d["data"])}
+    result = paystack_item(d["data"])
+    retry_if_grant_failed(result)
+    return {"ok": True, **result}
 
 
 @app.api_route("/sweep/paystack", methods=["GET", "POST"])
@@ -362,10 +404,54 @@ def stripe_ok(body: bytes, header: str) -> bool:
     pairs = [p.split("=", 1) for p in header.split(",") if "=" in p]
     t = next((v for k, v in pairs if k == "t"), "")
     sigs = [v for k, v in pairs if k == "v1"]
-    if not t or abs(time.time() - int(t)) > 300:
+    try:
+        timestamp = int(t)
+    except ValueError:
+        return False
+    if abs(time.time() - timestamp) > 300:
         return False
     good = hmac.new(STRIPE_WHSEC.encode(), f"{t}.".encode() + body, hashlib.sha256).hexdigest()
     return any(hmac.compare_digest(good, s) for s in sigs)
+
+
+def stripe_products(data):
+    metadata = data.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    def mapped(candidates):
+        products = []
+        for candidate in candidates:
+            row = access_map_row(candidate)
+            if row and row[NAME_COL] not in products:
+                products.append(row[NAME_COL])
+        return products
+
+    line_items = data.get("line_items")
+    line_item_data = line_items.get("data", []) if isinstance(line_items, dict) else []
+    products = mapped([item.get("description") for item in line_item_data if isinstance(item, dict)])
+    if products:
+        return products
+
+    product_names = metadata.get("product_names")
+    if isinstance(product_names, str):
+        product_names = [p for p in re.split(r"[|\n]", product_names) if p.strip()]
+    products = mapped(product_names if isinstance(product_names, list) else [])
+    if products:
+        return products
+
+    metadata_products = [metadata.get(key) for key in
+                        ("product_name", "course_name", "product", "course")]
+    products = mapped(metadata_products)
+    if products:
+        return products
+
+    candidates = [data.get("description"), data.get("client_reference_id")]
+    products = mapped(candidates)
+    if products:
+        return products
+    unmatched_metadata = product_names if isinstance(product_names, list) else []
+    return next((str(candidate).strip()
+                 for candidate in unmatched_metadata + metadata_products + candidates if candidate),
+                "unknown-stripe-product")
 
 
 @app.post("/webhook/stripe")
@@ -375,17 +461,29 @@ async def stripe_hook(request: Request):
         raise HTTPException(401)
     e = json.loads(body)
     log_raw("stripe", e)
-    if e["type"] not in ("payment_intent.succeeded", "checkout.session.completed"):
+    event_type = e["type"]
+    if event_type not in ("payment_intent.succeeded", "checkout.session.completed",
+                          "checkout.session.async_payment_succeeded"):
         return {"ok": True, "ignored": e["type"]}
     o = e["data"]["object"]
-    if o["id"] in set(STRIPE_LEDGER.col_values(1)):
-        return {"ok": True, "duplicate": True}
+    if event_type.startswith("checkout.session.") and o.get("payment_status") != "paid":
+        return {"ok": True, "ignored": "checkout session is not paid"}
     cd = o.get("customer_details") or {}
-    STRIPE_LEDGER.append_row([o["id"], now(), e["type"],
-                              cd.get("email") or o.get("receipt_email") or "", cd.get("name") or "",
-                              (o.get("amount_total") or o.get("amount") or 0) / 100,
-                              o.get("currency", ""), o.get("description") or ""])
-    return {"ok": True}
+    metadata = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+    email = (cd.get("email") or o.get("customer_email") or o.get("receipt_email")
+             or metadata.get("email") or "")
+    name = cd.get("name") or metadata.get("name") or ""
+    payment_intent = o.get("payment_intent")
+    ref = (payment_intent.get("id") if isinstance(payment_intent, dict) else payment_intent) or o["id"]
+    result = fulfil("stripe", str(ref), name, email, (o.get("amount_total") or o.get("amount") or 0) / 100,
+                    o.get("currency", ""), stripe_products(o), access_map_row)
+    retry_if_grant_failed(result)
+
+    if o["id"] not in set(STRIPE_LEDGER.col_values(1)):
+        STRIPE_LEDGER.append_row([o["id"], now(), event_type, email, name,
+                                  (o.get("amount_total") or o.get("amount") or 0) / 100,
+                                  o.get("currency", ""), o.get("description") or ""])
+    return {"ok": True, **result}
 
 
 # ---------------- admin / debug ----------------
