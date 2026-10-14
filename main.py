@@ -1,7 +1,9 @@
 # paystack_ghl_sync/main.py
 import csv, hashlib, hmac, json, os, re, secrets, smtplib, threading, time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from functools import lru_cache
 import base64
 
 import gspread
@@ -127,6 +129,22 @@ PAYMENTS = ws("Payments", ["key", "time_utc", "source", "reference", "buyer_name
 RAW = ws("Raw", ["time_utc", "source", "payload"])
 STRIPE_LEDGER = ws("StripeLedger", ["id", "time_utc", "type", "email", "name",
                                     "amount", "currency", "description"])
+
+LEAD_HEADERS = [
+    "Recorded At", "Created At", "Opportunity ID", "Contact ID", "Name",
+    "Email", "Phone", "Pipeline", "Stage", "Status", "Source",
+    "Opportunity Value", "Currency", "Payment Details", "Tags", "Custom Fields",
+]
+ALL_LEADS = ws("All_Leads", LEAD_HEADERS)
+lead_headers = ALL_LEADS.row_values(1)
+if not lead_headers:
+    ALL_LEADS.update(range_name="A1", values=[LEAD_HEADERS])
+elif lead_headers != LEAD_HEADERS:
+    raise RuntimeError(
+        "The All_Leads worksheet already has different headers. "
+        "Rename or clear that tab before starting the lead sync."
+    )
+LEAD_LOCK = threading.Lock()
 
 
 def now():
@@ -347,6 +365,235 @@ async def ghl(request: Request):
                     c.get("currency", "USD"), prods, access_map_row)
     retry_if_grant_failed(result)
     return {"ok": True, **result}
+
+
+# ---------------- GHL pipeline leads ----------------
+GHL_BASE = "https://services.leadconnectorhq.com"
+GHL_LEAD_PIPELINE_NAME = "FREE AI MASTERCLASS {OCT 17TH 2026}"
+
+
+def lead_ghl_headers():
+    return {
+        "Authorization": f"Bearer {GHL_TOKEN}",
+        "Version": "2021-07-28",
+        "Accept": "application/json",
+    }
+
+
+@lru_cache(maxsize=1)
+def get_lead_pipeline():
+    response = httpx.get(
+        f"{GHL_BASE}/opportunities/pipelines",
+        params={"locationId": GHL_LOCATION},
+        headers=lead_ghl_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    pipelines = response.json().get("pipelines", [])
+    for pipeline in pipelines:
+        if pipeline.get("name", "").strip().casefold() == GHL_LEAD_PIPELINE_NAME.casefold():
+            return {
+                "id": pipeline["id"],
+                "name": pipeline["name"],
+                "stages": {
+                    stage["id"]: stage["name"]
+                    for stage in pipeline.get("stages", [])
+                },
+            }
+    names = [pipeline.get("name", "") for pipeline in pipelines]
+    raise RuntimeError(
+        f"GHL pipeline {GHL_LEAD_PIPELINE_NAME!r} was not found. "
+        f"Available pipelines: {names}"
+    )
+
+
+def fetch_lead_opportunities():
+    pipeline = get_lead_pipeline()
+    params = {
+        "location_id": GHL_LOCATION,
+        "pipeline_id": pipeline["id"],
+        "limit": 100,
+    }
+    opportunities = []
+    while True:
+        response = httpx.get(
+            f"{GHL_BASE}/opportunities/search",
+            params=params,
+            headers=lead_ghl_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        batch = data.get("opportunities", [])
+        opportunities.extend(batch)
+        meta = data.get("meta") or {}
+        if not batch or not meta.get("startAfterId"):
+            break
+        params["startAfter"] = meta["startAfter"]
+        params["startAfterId"] = meta["startAfterId"]
+    return opportunities
+
+
+def fetch_lead_opportunity(opportunity_id):
+    response = httpx.get(
+        f"{GHL_BASE}/opportunities/{opportunity_id}",
+        headers=lead_ghl_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data.get("opportunity", data)
+
+
+def fetch_lead_contact(contact_id):
+    response = httpx.get(
+        f"{GHL_BASE}/contacts/{contact_id}",
+        headers=lead_ghl_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json().get("contact", {})
+
+
+def lead_payment_details(opportunity, contact):
+    detail = {
+        key: value
+        for key, value in opportunity.items()
+        if any(word in key.casefold() for word in
+               ("payment", "amount", "currency", "transaction", "order", "invoice", "price", "paid"))
+    }
+    terms = ("payment", "amount", "currency", "transaction", "order",
+             "invoice", "price", "paid")
+    for owner, fields in (
+        ("opportunity", opportunity.get("customFields") or []),
+        ("contact", contact.get("customFields") or []),
+    ):
+        if isinstance(fields, list):
+            payment_fields = [
+                field for field in fields
+                if isinstance(field, dict)
+                and any(
+                    word in str(field.get(key, "")).casefold()
+                    for key in ("name", "field", "key", "id", "label")
+                    for word in terms
+                )
+            ]
+            if payment_fields:
+                detail[f"{owner}CustomFields"] = payment_fields
+    return json.dumps(detail, ensure_ascii=False, default=str) if detail else ""
+
+
+def lead_row(opportunity, contact, pipeline):
+    contact = contact or opportunity.get("contact") or {}
+    name = (
+        contact.get("name")
+        or " ".join(filter(None, [contact.get("firstName"), contact.get("lastName")]))
+        or opportunity.get("contactName")
+        or opportunity.get("name", "")
+    )
+    contact_fields = contact.get("customFields") or []
+    opportunity_fields = opportunity.get("customFields") or []
+    custom_fields = {
+        "contact": contact_fields,
+        "opportunity": opportunity_fields,
+    }
+    tags = contact.get("tags") or []
+    return [
+        now(),
+        opportunity.get("createdAt", ""),
+        opportunity.get("id", ""),
+        opportunity.get("contactId") or contact.get("id", ""),
+        name,
+        contact.get("email") or opportunity.get("contactEmail", ""),
+        contact.get("phone") or opportunity.get("contactPhone", ""),
+        pipeline["name"],
+        pipeline["stages"].get(
+            opportunity.get("pipelineStageId"),
+            opportunity.get("pipelineStageId", ""),
+        ),
+        opportunity.get("status", ""),
+        opportunity.get("source") or contact.get("source", ""),
+        opportunity.get("monetaryValue", ""),
+        opportunity.get("currency", ""),
+        lead_payment_details(opportunity, contact),
+        ", ".join(str(tag) for tag in tags),
+        json.dumps(custom_fields, ensure_ascii=False, default=str),
+    ]
+
+
+def append_lead_opportunities(opportunities):
+    if not opportunities:
+        return 0
+    pipeline = get_lead_pipeline()
+    with LEAD_LOCK:
+        existing_ids = set(ALL_LEADS.col_values(3))
+        fresh, seen = [], set()
+        for opportunity in opportunities:
+            opportunity_id = opportunity.get("id")
+            if opportunity_id and opportunity_id not in existing_ids and opportunity_id not in seen:
+                fresh.append(opportunity)
+                seen.add(opportunity_id)
+
+        def make_row(opportunity):
+            contact = opportunity.get("contact") or {}
+            contact_id = opportunity.get("contactId") or contact.get("id")
+            if contact_id and (
+                not contact.get("email")
+                or not contact.get("phone")
+                or not (contact.get("name") or contact.get("firstName") or opportunity.get("contactName"))
+            ):
+                contact = fetch_lead_contact(contact_id)
+            return lead_row(opportunity, contact, pipeline)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            rows = list(executor.map(make_row, fresh))
+        if rows:
+            ALL_LEADS.append_rows(rows, value_input_option="USER_ENTERED")
+        return len(rows)
+
+
+@app.post("/sync/leads")
+def sync_ghl_leads(key: str):
+    check(key)
+    opportunities = fetch_lead_opportunities()
+    added = append_lead_opportunities(opportunities)
+    return {"fetched": len(opportunities), "added": added}
+
+
+@app.post("/webhook/ghl/leads")
+async def ghl_lead_webhook(request: Request):
+    check(request.query_params.get("key"))
+    payload = await request.json()
+    custom = payload.get("customData") or payload.get("custom_data") or {}
+    embedded_opportunity = payload.get("opportunity") or {}
+    event_type = payload.get("type", "")
+    opportunity_id = (
+        custom.get("opportunity_id")
+        or custom.get("opportunityId")
+        or payload.get("opportunity_id")
+        or payload.get("opportunityId")
+        or embedded_opportunity.get("id")
+        or (payload.get("id") if event_type.startswith("Opportunity") else None)
+    )
+    if not opportunity_id:
+        raise HTTPException(400, "No opportunity id in GHL webhook payload")
+
+    pipeline = get_lead_pipeline()
+    event_pipeline_id = (
+        custom.get("pipeline_id")
+        or custom.get("pipelineId")
+        or payload.get("pipeline_id")
+        or payload.get("pipelineId")
+        or embedded_opportunity.get("pipelineId")
+    )
+    if event_pipeline_id and event_pipeline_id != pipeline["id"]:
+        return {"status": "ignored", "reason": "different pipeline"}
+
+    opportunity = fetch_lead_opportunity(opportunity_id)
+    if opportunity.get("pipelineId") != pipeline["id"]:
+        return {"status": "ignored", "reason": "different pipeline"}
+    added = append_lead_opportunities([opportunity])
+    return {"status": "ok", "added": added}
 
 
 # ---------------- Paystack (NGN) ----------------
