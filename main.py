@@ -134,15 +134,25 @@ LEAD_HEADERS = [
     "Recorded At", "Created At", "Opportunity ID", "Contact ID", "Name",
     "Email", "Phone", "Pipeline", "Stage", "Status", "Source",
     "Opportunity Value", "Currency", "Payment Details", "Tags", "Custom Fields",
+    "Email Status", "Email Sent At", "Resend Email ID", "Email Attempts",
+    "Email Last Attempt At", "Email Error",
 ]
 ALL_LEADS = ws("All_Leads", LEAD_HEADERS)
+if ALL_LEADS.col_count < len(LEAD_HEADERS):
+    ALL_LEADS.resize(cols=len(LEAD_HEADERS))
 lead_headers = ALL_LEADS.row_values(1)
 if not lead_headers:
     ALL_LEADS.update(range_name="A1", values=[LEAD_HEADERS])
+elif lead_headers == LEAD_HEADERS[:16]:
+    ALL_LEADS.update(
+        range_name="Q1:V1",
+        values=[LEAD_HEADERS[16:]],
+    )
 elif lead_headers != LEAD_HEADERS:
     raise RuntimeError(
-        "The All_Leads worksheet already has different headers. "
-        "Rename or clear that tab before starting the lead sync."
+        "The All_Leads worksheet has unexpected headers. "
+        "Keep the existing lead columns in their current order and append "
+        "the email tracking columns to continue."
     )
 LEAD_LOCK = threading.Lock()
 
@@ -518,12 +528,182 @@ def lead_row(opportunity, contact, pipeline):
         lead_payment_details(opportunity, contact),
         ", ".join(str(tag) for tag in tags),
         json.dumps(custom_fields, ensure_ascii=False, default=str),
+        "Pending" if contact.get("email") or opportunity.get("contactEmail") else "No Email",
+        "",
+        "",
+        0,
+        "",
+        "",
     ]
+
+
+LEAD_EMAIL_SUBJECT = "Webinar Registration Confirmation: Join Us This Saturday"
+LEAD_EMAIL_IDEMPOTENCY_PREFIX = "webinar-registration-v1-"
+LEAD_EMAIL_STATUS_COL = LEAD_HEADERS.index("Email Status") + 1
+LEAD_EMAIL_ELIGIBLE_STATUSES = {"", "Pending", "Failed", "No Email"}
+
+
+def lead_email_body(name):
+    first_name = (name or "").strip().split(maxsplit=1)[0] if name else ""
+    greeting = f"Hello {first_name}," if first_name else "Hello,"
+    return f"""{greeting}
+
+Thank you for registering for our webinar, “How to Leverage Your Experience to Grow Your Income to 6 Figures in 90 Days With AI Without Being Technical.”
+
+We're excited to have you join us this Saturday! Please find the webinar details below:
+
+Time: 6:00 PM WAT | 11:00 AM MST | 1:00 PM EST
+Join the Webinar: https://zoom.us/meeting/register/YUhuXQTZSwmTX7w-nossIw
+
+Kindly ensure you join on time so you don't miss any part of the session. We look forward to having you!
+
+Kind regards,
+Business Analysis School"""
+
+
+def update_lead_email_state(row_number, status, sent_at, resend_id, attempts, attempted_at, error):
+    ALL_LEADS.update(
+        range_name=f"Q{row_number}:V{row_number}",
+        values=[[status, sent_at, resend_id, attempts, attempted_at, error]],
+    )
+
+
+def send_lead_email(row_number):
+    with LEAD_LOCK:
+        row = ALL_LEADS.row_values(row_number)
+        status = row[LEAD_EMAIL_STATUS_COL - 1] if len(row) >= LEAD_EMAIL_STATUS_COL else ""
+        email = row[LEAD_HEADERS.index("Email")]
+        opportunity_id = row[LEAD_HEADERS.index("Opportunity ID")]
+        if status not in LEAD_EMAIL_ELIGIBLE_STATUSES:
+            return "skipped"
+        if not email or not opportunity_id:
+            return "skipped"
+
+        attempts_index = LEAD_HEADERS.index("Email Attempts")
+        try:
+            attempts = int(row[attempts_index] or 0) + 1
+        except (IndexError, ValueError):
+            attempts = 1
+        attempted_at = now()
+        update_lead_email_state(
+            row_number, "Sending", "", "", attempts, attempted_at, ""
+        )
+
+    if not env("RESEND_API_KEY") or not MAIL_FROM:
+        with LEAD_LOCK:
+            update_lead_email_state(
+                row_number, "Failed", "", "", attempts, attempted_at,
+                "RESEND_API_KEY or MAIL_FROM is not configured",
+            )
+        return "failed"
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email.strip()):
+        with LEAD_LOCK:
+            update_lead_email_state(
+                row_number, "Failed", "", "", attempts, attempted_at,
+                "Lead email address is invalid",
+            )
+        return "failed"
+
+    idempotency_key = LEAD_EMAIL_IDEMPOTENCY_PREFIX + hashlib.sha256(
+        opportunity_id.encode("utf-8")
+    ).hexdigest()
+    try:
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            timeout=20,
+            headers={
+                "Authorization": f"Bearer {env('RESEND_API_KEY')}",
+                "Idempotency-Key": idempotency_key,
+            },
+            json={
+                "from": MAIL_FROM,
+                "to": [email.strip()],
+                "subject": LEAD_EMAIL_SUBJECT,
+                "text": lead_email_body(row[LEAD_HEADERS.index("Name")]),
+                "reply_to": REPLY_TO,
+            },
+        )
+    except httpx.RequestError:
+        with LEAD_LOCK:
+            update_lead_email_state(
+                row_number, "Unknown", "", "", attempts, attempted_at,
+                "Resend request outcome is unknown; check Resend before retrying",
+            )
+        return "unknown"
+
+    if response.status_code >= 500:
+        with LEAD_LOCK:
+            update_lead_email_state(
+                row_number, "Unknown", "", "", attempts, attempted_at,
+                f"Resend returned HTTP {response.status_code}; delivery is unconfirmed",
+            )
+        return "unknown"
+    if response.status_code >= 400:
+        with LEAD_LOCK:
+            update_lead_email_state(
+                row_number, "Failed", "", "", attempts, attempted_at,
+                f"Resend rejected the request (HTTP {response.status_code})",
+            )
+        return "failed"
+
+    try:
+        resend_id = response.json().get("id", "")
+    except (ValueError, AttributeError):
+        resend_id = ""
+    sent_at = now()
+    with LEAD_LOCK:
+        update_lead_email_state(
+            row_number, "Sent", sent_at, resend_id, attempts, attempted_at, ""
+        )
+    return "sent"
+
+
+def send_lead_emails(opportunity_ids=None, limit=15, retry_failed=False):
+    selected_ids = set(opportunity_ids) if opportunity_ids is not None else None
+    values = ALL_LEADS.get_all_values()
+    results = {
+        "sent": 0, "failed": 0, "unknown": 0, "skipped": 0,
+        "remaining": 0, "failed_remaining": 0,
+    }
+    candidates = []
+    for row_number, row in enumerate(values[1:], start=2):
+        opportunity_id = row[LEAD_HEADERS.index("Opportunity ID")] if len(row) > 2 else ""
+        status = row[LEAD_EMAIL_STATUS_COL - 1] if len(row) >= LEAD_EMAIL_STATUS_COL else ""
+        email = row[LEAD_HEADERS.index("Email")] if len(row) > LEAD_HEADERS.index("Email") else ""
+        if selected_ids is not None and opportunity_id not in selected_ids:
+            continue
+        if status == "Failed" and not retry_failed:
+            continue
+        if status not in LEAD_EMAIL_ELIGIBLE_STATUSES or not email:
+            continue
+        candidates.append(row_number)
+        if len(candidates) >= limit:
+            break
+
+    for row_number in candidates:
+        result = send_lead_email(row_number)
+        results[result] += 1
+    current_rows = ALL_LEADS.get_all_values()[1:]
+    results["remaining"] = sum(
+        1 for row in current_rows
+        if len(row) > LEAD_EMAIL_STATUS_COL - 1
+        and row[LEAD_EMAIL_STATUS_COL - 1] in {"", "Pending"}
+        and row[LEAD_HEADERS.index("Email")]
+    )
+    results["failed_remaining"] = sum(
+        1 for row in current_rows
+        if len(row) > LEAD_EMAIL_STATUS_COL - 1
+        and row[LEAD_EMAIL_STATUS_COL - 1] == "Failed"
+    )
+    return results
 
 
 def append_lead_opportunities(opportunities):
     if not opportunities:
-        return 0
+        return 0, {
+            "sent": 0, "failed": 0, "unknown": 0, "skipped": 0,
+            "remaining": 0, "failed_remaining": 0,
+        }
     pipeline = get_lead_pipeline()
     with LEAD_LOCK:
         existing_ids = set(ALL_LEADS.col_values(3))
@@ -549,15 +729,40 @@ def append_lead_opportunities(opportunities):
             rows = list(executor.map(make_row, fresh))
         if rows:
             ALL_LEADS.append_rows(rows, value_input_option="USER_ENTERED")
-        return len(rows)
+    opportunity_ids = [row[2] for row in rows]
+    email_results = send_lead_emails(opportunity_ids=opportunity_ids) if rows else {
+        "sent": 0, "failed": 0, "unknown": 0, "skipped": 0,
+        "remaining": 0, "failed_remaining": 0,
+    }
+    return len(rows), email_results
 
 
 @app.post("/sync/leads")
 def sync_ghl_leads(key: str):
     check(key)
     opportunities = fetch_lead_opportunities()
-    added = append_lead_opportunities(opportunities)
-    return {"fetched": len(opportunities), "added": added}
+    added, email_results = append_lead_opportunities(opportunities)
+    return {"fetched": len(opportunities), "added": added, "email": email_results}
+
+
+@app.post("/sync/leads/email")
+def send_pending_lead_emails(key: str, limit: int = 15, retry_failed: bool = False):
+    check(key)
+    if not 1 <= limit <= 15:
+        raise HTTPException(400, "limit must be between 1 and 15")
+    return send_lead_emails(limit=limit, retry_failed=retry_failed)
+
+
+@app.get("/sync/leads/email/status")
+def lead_email_status(key: str):
+    check(key)
+    values = ALL_LEADS.get_all_values()
+    status_counts = {}
+    for row in values[1:]:
+        status = row[LEAD_EMAIL_STATUS_COL - 1] if len(row) >= LEAD_EMAIL_STATUS_COL else ""
+        status = status or "Pending"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {"total_leads": max(len(values) - 1, 0), "email_status": status_counts}
 
 
 @app.post("/webhook/ghl/leads")
@@ -592,8 +797,8 @@ async def ghl_lead_webhook(request: Request):
     opportunity = fetch_lead_opportunity(opportunity_id)
     if opportunity.get("pipelineId") != pipeline["id"]:
         return {"status": "ignored", "reason": "different pipeline"}
-    added = append_lead_opportunities([opportunity])
-    return {"status": "ok", "added": added}
+    added, email_results = append_lead_opportunities([opportunity])
+    return {"status": "ok", "added": added, "email": email_results}
 
 
 # ---------------- Paystack (NGN) ----------------
